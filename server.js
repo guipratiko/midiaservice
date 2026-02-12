@@ -95,6 +95,11 @@ app.get('/download/:filename', (req, res) => {
     // Enviar arquivo
     res.download(filePath, (err) => {
       if (err) {
+        // Cliente abortou a conexão (cancelou download, fechou aba, timeout) - não é erro do servidor
+        const isAborted = err.code === 'ECONNABORTED' || err.message === 'Request aborted';
+        if (isAborted) {
+          return; // Não logar nem enviar resposta; a conexão já foi fechada
+        }
         console.error('Erro ao fazer download:', err);
         if (!res.headersSent) {
           res.status(500).json({ error: 'Erro ao fazer download do arquivo' });
