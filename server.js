@@ -4,12 +4,21 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const cors = require('cors');
+const mongoose = require('mongoose');
+
+const Media = require('./models/media');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_TOKEN = process.env.UPLOAD_TOKEN || 'seu-token-secreto-aqui';
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE) || 100 * 1024 * 1024; // 100MB padrão
+const MONGODB_URI = process.env.MONGODB_URI;
+
+if (!MONGODB_URI) {
+  console.error('Defina MONGODB_URI no ambiente (arquivo .env ou variável do sistema).');
+  process.exit(1);
+}
 
 // Middleware
 app.use(cors());
@@ -58,17 +67,36 @@ const authenticateToken = (req, res, next) => {
 };
 
 // Endpoint de upload (com autenticação)
-app.post('/upload', authenticateToken, upload.single('file'), (req, res) => {
+app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'Nenhum arquivo foi enviado' });
     }
 
+    let doc;
+    try {
+      doc = await Media.create({
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        size: req.file.size,
+        mimeType: req.file.mimetype || 'application/octet-stream'
+      });
+    } catch (dbErr) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (_) {
+        /* ignore */
+      }
+      console.error('Erro ao registrar mídia no banco:', dbErr);
+      return res.status(500).json({ error: 'Erro ao registrar o arquivo no banco de dados' });
+    }
+
     const fileUrl = `/download/${req.file.filename}`;
-    
+
     res.status(200).json({
       success: true,
       message: 'Arquivo enviado com sucesso',
+      id: doc._id.toString(),
       filename: req.file.filename,
       originalName: req.file.originalname,
       size: req.file.size,
@@ -82,23 +110,30 @@ app.post('/upload', authenticateToken, upload.single('file'), (req, res) => {
 });
 
 // Endpoint de download (sem autenticação)
-app.get('/download/:filename', (req, res) => {
+app.get('/download/:filename', async (req, res) => {
   try {
     const filename = req.params.filename;
     const filePath = path.join(UPLOAD_DIR, filename);
+    const onDisk = fs.existsSync(filePath);
+    const inDb = await Media.findOne({ filename }).lean();
 
-    // Verificar se o arquivo existe
-    if (!fs.existsSync(filePath)) {
+    if (!onDisk) {
+      if (inDb) {
+        return res.status(404).json({ error: 'Arquivo não encontrado no armazenamento' });
+      }
       return res.status(404).json({ error: 'Arquivo não encontrado' });
     }
 
-    // Enviar arquivo
+    // Arquivo legado no disco sem registro no banco ainda pode ser baixado
+    if (!inDb) {
+      console.warn(`Download sem registro no banco (legado): ${filename}`);
+    }
+
     res.download(filePath, (err) => {
       if (err) {
-        // Cliente abortou a conexão (cancelou download, fechou aba, timeout) - não é erro do servidor
         const isAborted = err.code === 'ECONNABORTED' || err.message === 'Request aborted';
         if (isAborted) {
-          return; // Não logar nem enviar resposta; a conexão já foi fechada
+          return;
         }
         console.error('Erro ao fazer download:', err);
         if (!res.headersSent) {
@@ -114,9 +149,11 @@ app.get('/download/:filename', (req, res) => {
 
 // Endpoint de health check
 app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
+  const mongoOk = mongoose.connection.readyState === 1;
+  res.status(mongoOk ? 200 : 503).json({
+    status: mongoOk ? 'ok' : 'degraded',
     service: 'midiaservice',
+    mongodb: mongoOk ? 'connected' : 'disconnected',
     timestamp: new Date().toISOString()
   });
 });
@@ -125,8 +162,8 @@ app.get('/health', (req, res) => {
 app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
-      return res.status(400).json({ 
-        error: `Arquivo muito grande. Tamanho máximo permitido: ${MAX_FILE_SIZE / (1024 * 1024)}MB` 
+      return res.status(400).json({
+        error: `Arquivo muito grande. Tamanho máximo permitido: ${MAX_FILE_SIZE / (1024 * 1024)}MB`
       });
     }
     return res.status(400).json({ error: `Erro no upload: ${error.message}` });
@@ -134,12 +171,20 @@ app.use((error, req, res, next) => {
   next(error);
 });
 
-// Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`🚀 MidiaService rodando na porta ${PORT}`);
-  console.log(`📁 Diretório de uploads: ${UPLOAD_DIR}`);
-  console.log(`🔐 Autenticação: Token Bearer`);
-  console.log(`📤 Upload: POST /upload (com autenticação)`);
-  console.log(`📥 Download: GET /download/:filename (público)`);
-});
+async function start() {
+  await mongoose.connect(MONGODB_URI);
+  console.log('MongoDB conectado.');
 
+  app.listen(PORT, () => {
+    console.log(`🚀 MidiaService rodando na porta ${PORT}`);
+    console.log(`📁 Diretório de uploads: ${UPLOAD_DIR}`);
+    console.log(`🔐 Autenticação: Token Bearer`);
+    console.log(`📤 Upload: POST /upload (com autenticação)`);
+    console.log(`📥 Download: GET /download/:filename (público)`);
+  });
+}
+
+start().catch((err) => {
+  console.error('Falha ao iniciar:', err);
+  process.exit(1);
+});
