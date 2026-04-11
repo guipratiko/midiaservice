@@ -3,6 +3,7 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const cors = require('cors');
 const mongoose = require('mongoose');
 
@@ -29,17 +30,34 @@ if (!fs.existsSync(UPLOAD_DIR)) {
   fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 }
 
+const MEDIA_KEY_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+const MEDIA_KEY_LENGTH = 16;
+
+function randomMediaKey(length = MEDIA_KEY_LENGTH) {
+  const bytes = crypto.randomBytes(length);
+  let out = '';
+  for (let i = 0; i < length; i++) {
+    out += MEDIA_KEY_CHARS[bytes[i] % MEDIA_KEY_CHARS.length];
+  }
+  return out;
+}
+
 // Configuração do Multer para armazenamento de arquivos
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, UPLOAD_DIR);
   },
   filename: (req, file, cb) => {
-    // Manter nome original com timestamp para evitar conflitos
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    const ext = path.extname(file.originalname);
-    const name = path.basename(file.originalname, ext);
-    cb(null, `${name}-${uniqueSuffix}${ext}`);
+    const rawExt = path.extname(file.originalname);
+    const ext = rawExt ? rawExt.toLowerCase().replace(/[^.a-z0-9]/g, '') : '';
+    let storedName;
+    for (let attempt = 0; attempt < 32; attempt++) {
+      storedName = `${randomMediaKey()}${ext}`;
+      if (!fs.existsSync(path.join(UPLOAD_DIR, storedName))) {
+        return cb(null, storedName);
+      }
+    }
+    cb(new Error('Não foi possível gerar nome de arquivo único'));
   }
 });
 
