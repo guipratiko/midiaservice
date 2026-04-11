@@ -5,7 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const { GridFSBucket } = require('mongodb');
+const { GridFSBucket, ObjectId } = require('mongodb');
 
 const Media = require('./models/media');
 
@@ -49,6 +49,35 @@ function deleteGridFSFile(bucket, id) {
   return new Promise((resolve, reject) => {
     bucket.delete(id, (err) => (err ? reject(err) : resolve()));
   });
+}
+
+function toGridFsObjectId(id) {
+  if (!id) return null;
+  if (id instanceof ObjectId) return id;
+  try {
+    return new ObjectId(String(id));
+  } catch {
+    return null;
+  }
+}
+
+/** Resolve o _id do arquivo no GridFS pelo gridfsId ou pelo filename (revisão mais recente). */
+async function resolveGridFsFileId(bucket, doc) {
+  if (doc.gridfsId) {
+    const oid = toGridFsObjectId(doc.gridfsId);
+    if (oid) {
+      const found = await bucket.find({ _id: oid }).limit(1).toArray();
+      if (found.length) {
+        return oid;
+      }
+    }
+  }
+  const byName = await bucket
+    .find({ filename: doc.filename })
+    .sort({ uploadDate: -1 })
+    .limit(1)
+    .toArray();
+  return byName.length ? byName[0]._id : null;
 }
 
 // Middleware
@@ -177,11 +206,27 @@ app.get('/download/:filename', async (req, res) => {
     const filename = req.params.filename;
     const doc = await Media.findOne({ filename }).lean();
 
-    if (!doc || !doc.gridfsId) {
+    if (!doc) {
       return res.status(404).json({ error: 'Arquivo não encontrado' });
     }
 
     const bucket = getGridFSBucket();
+    let fileId;
+    try {
+      fileId = await resolveGridFsFileId(bucket, doc);
+    } catch (lookupErr) {
+      console.error('Erro ao localizar arquivo no GridFS:', lookupErr);
+      return res.status(500).json({ error: 'Erro ao acessar o armazenamento' });
+    }
+
+    if (!fileId) {
+      return res.status(404).json({ error: 'Arquivo não encontrado no armazenamento' });
+    }
+
+    if (!doc.gridfsId || toGridFsObjectId(doc.gridfsId)?.toString() !== fileId.toString()) {
+      Media.updateOne({ _id: doc._id }, { $set: { gridfsId: fileId } }).catch(() => {});
+    }
+
     res.setHeader('Content-Type', doc.mimeType);
     const asciiName = doc.originalName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '_');
     res.setHeader(
@@ -189,9 +234,10 @@ app.get('/download/:filename', async (req, res) => {
       `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(doc.originalName)}`
     );
 
-    const downloadStream = bucket.openDownloadStream(doc.gridfsId);
+    const downloadStream = bucket.openDownloadStream(fileId);
 
     downloadStream.on('error', (err) => {
+      console.error('Stream de download GridFS:', err.message);
       if (!res.headersSent) {
         res.status(404).json({ error: 'Arquivo não encontrado no armazenamento' });
       } else {

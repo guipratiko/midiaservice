@@ -6,7 +6,7 @@ const mediaSchema = new mongoose.Schema(
     originalName: { type: String, required: true },
     size: { type: Number, required: true },
     mimeType: { type: String, default: 'application/octet-stream' },
-    gridfsId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true }
+    gridfsId: { type: mongoose.Schema.Types.ObjectId, index: true }
   },
   { timestamps: true }
 );
