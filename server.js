@@ -2,33 +2,58 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const { GridFSBucket } = require('mongodb');
 
 const Media = require('./models/media');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_TOKEN = process.env.UPLOAD_TOKEN || 'seu-token-secreto-aqui';
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE) || 100 * 1024 * 1024; // 100MB padrão
+const BYTES_PER_MB = 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_MB = 100;
+const _maxFromEnv = Number.parseInt(process.env.MAX_FILE_SIZE, 10);
+const MAX_FILE_SIZE =
+  Number.isFinite(_maxFromEnv) && _maxFromEnv > 0
+    ? _maxFromEnv
+    : DEFAULT_MAX_UPLOAD_MB * BYTES_PER_MB;
 const MONGODB_URI = process.env.MONGODB_URI;
+const GRIDFS_BUCKET_NAME = process.env.GRIDFS_BUCKET_NAME || 'mediaFs';
 
 if (!MONGODB_URI) {
   console.error('Defina MONGODB_URI no ambiente (arquivo .env ou variável do sistema).');
   process.exit(1);
 }
 
+let gridFSBucket;
+
+function getGridFSBucket() {
+  if (!gridFSBucket) {
+    gridFSBucket = new GridFSBucket(mongoose.connection.db, { bucketName: GRIDFS_BUCKET_NAME });
+  }
+  return gridFSBucket;
+}
+
+function uploadBufferToGridFS(bucket, filename, buffer, metadata) {
+  return new Promise((resolve, reject) => {
+    const uploadStream = bucket.openUploadStream(filename, { metadata });
+    uploadStream.on('error', reject);
+    uploadStream.on('finish', () => resolve(uploadStream.id));
+    uploadStream.end(buffer);
+  });
+}
+
+function deleteGridFSFile(bucket, id) {
+  return new Promise((resolve, reject) => {
+    bucket.delete(id, (err) => (err ? reject(err) : resolve()));
+  });
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// Criar diretório de uploads se não existir
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-}
 
 const MEDIA_KEY_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const MEDIA_KEY_LENGTH = 16;
@@ -42,27 +67,19 @@ function randomMediaKey(length = MEDIA_KEY_LENGTH) {
   return out;
 }
 
-// Configuração do Multer para armazenamento de arquivos
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (req, file, cb) => {
-    const rawExt = path.extname(file.originalname);
-    const ext = rawExt ? rawExt.toLowerCase().replace(/[^.a-z0-9]/g, '') : '';
-    let storedName;
-    for (let attempt = 0; attempt < 32; attempt++) {
-      storedName = `${randomMediaKey()}${ext}`;
-      if (!fs.existsSync(path.join(UPLOAD_DIR, storedName))) {
-        return cb(null, storedName);
-      }
+async function uniqueStoredFilename(ext) {
+  for (let attempt = 0; attempt < 32; attempt++) {
+    const name = `${randomMediaKey()}${ext}`;
+    const exists = await Media.exists({ filename: name });
+    if (!exists) {
+      return name;
     }
-    cb(new Error('Não foi possível gerar nome de arquivo único'));
   }
-});
+  throw new Error('Não foi possível gerar nome de arquivo único');
+}
 
 const upload = multer({
-  storage: storage,
+  storage: multer.memoryStorage(),
   limits: {
     fileSize: MAX_FILE_SIZE
   }
@@ -91,17 +108,44 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
       return res.status(400).json({ error: 'Nenhum arquivo foi enviado' });
     }
 
+    const rawExt = path.extname(req.file.originalname);
+    const ext = rawExt ? rawExt.toLowerCase().replace(/[^.a-z0-9]/g, '') : '';
+
+    let storedFilename;
+    try {
+      storedFilename = await uniqueStoredFilename(ext);
+    } catch (e) {
+      console.error(e);
+      return res.status(500).json({ error: 'Erro ao gerar identificador do arquivo' });
+    }
+
+    const mimeType = req.file.mimetype || 'application/octet-stream';
+    const bucket = getGridFSBucket();
+    let gridfsId;
+
+    try {
+      gridfsId = await uploadBufferToGridFS(bucket, storedFilename, req.file.buffer, {
+        originalName: req.file.originalname,
+        mimeType,
+        size: req.file.size
+      });
+    } catch (gridErr) {
+      console.error('Erro ao gravar no GridFS:', gridErr);
+      return res.status(500).json({ error: 'Erro ao armazenar o arquivo no banco' });
+    }
+
     let doc;
     try {
       doc = await Media.create({
-        filename: req.file.filename,
+        filename: storedFilename,
         originalName: req.file.originalname,
         size: req.file.size,
-        mimeType: req.file.mimetype || 'application/octet-stream'
+        mimeType,
+        gridfsId
       });
     } catch (dbErr) {
       try {
-        fs.unlinkSync(req.file.path);
+        await deleteGridFSFile(bucket, gridfsId);
       } catch (_) {
         /* ignore */
       }
@@ -109,13 +153,13 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
       return res.status(500).json({ error: 'Erro ao registrar o arquivo no banco de dados' });
     }
 
-    const fileUrl = `/download/${req.file.filename}`;
+    const fileUrl = `/download/${storedFilename}`;
 
     res.status(200).json({
       success: true,
       message: 'Arquivo enviado com sucesso',
       id: doc._id.toString(),
-      filename: req.file.filename,
+      filename: storedFilename,
       originalName: req.file.originalname,
       size: req.file.size,
       url: fileUrl,
@@ -131,37 +175,39 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
 app.get('/download/:filename', async (req, res) => {
   try {
     const filename = req.params.filename;
-    const filePath = path.join(UPLOAD_DIR, filename);
-    const onDisk = fs.existsSync(filePath);
-    const inDb = await Media.findOne({ filename }).lean();
+    const doc = await Media.findOne({ filename }).lean();
 
-    if (!onDisk) {
-      if (inDb) {
-        return res.status(404).json({ error: 'Arquivo não encontrado no armazenamento' });
-      }
+    if (!doc || !doc.gridfsId) {
       return res.status(404).json({ error: 'Arquivo não encontrado' });
     }
 
-    // Arquivo legado no disco sem registro no banco ainda pode ser baixado
-    if (!inDb) {
-      console.warn(`Download sem registro no banco (legado): ${filename}`);
-    }
+    const bucket = getGridFSBucket();
+    res.setHeader('Content-Type', doc.mimeType);
+    const asciiName = doc.originalName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '_');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(doc.originalName)}`
+    );
 
-    res.download(filePath, (err) => {
-      if (err) {
-        const isAborted = err.code === 'ECONNABORTED' || err.message === 'Request aborted';
-        if (isAborted) {
-          return;
-        }
-        console.error('Erro ao fazer download:', err);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Erro ao fazer download do arquivo' });
-        }
+    const downloadStream = bucket.openDownloadStream(doc.gridfsId);
+
+    downloadStream.on('error', (err) => {
+      if (!res.headersSent) {
+        res.status(404).json({ error: 'Arquivo não encontrado no armazenamento' });
+      } else {
+        downloadStream.destroy();
       }
     });
+
+    req.on('aborted', () => downloadStream.destroy());
+    res.on('close', () => downloadStream.destroy());
+
+    downloadStream.pipe(res);
   } catch (error) {
     console.error('Erro no download:', error);
-    res.status(500).json({ error: 'Erro ao processar o download do arquivo' });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro ao processar o download do arquivo' });
+    }
   }
 });
 
@@ -172,6 +218,8 @@ app.get('/health', (req, res) => {
     status: mongoOk ? 'ok' : 'degraded',
     service: 'midiaservice',
     mongodb: mongoOk ? 'connected' : 'disconnected',
+    storage: 'gridfs',
+    maxUploadMb: Math.round(MAX_FILE_SIZE / BYTES_PER_MB),
     timestamp: new Date().toISOString()
   });
 });
@@ -181,7 +229,7 @@ app.use((error, req, res, next) => {
   if (error instanceof multer.MulterError) {
     if (error.code === 'LIMIT_FILE_SIZE') {
       return res.status(400).json({
-        error: `Arquivo muito grande. Tamanho máximo permitido: ${MAX_FILE_SIZE / (1024 * 1024)}MB`
+        error: `Arquivo muito grande. Tamanho máximo permitido: ${Math.round(MAX_FILE_SIZE / BYTES_PER_MB)} MB`
       });
     }
     return res.status(400).json({ error: `Erro no upload: ${error.message}` });
@@ -192,10 +240,13 @@ app.use((error, req, res, next) => {
 async function start() {
   await mongoose.connect(MONGODB_URI);
   console.log('MongoDB conectado.');
+  gridFSBucket = new GridFSBucket(mongoose.connection.db, { bucketName: GRIDFS_BUCKET_NAME });
+  console.log(`GridFS bucket: ${GRIDFS_BUCKET_NAME}`);
 
   app.listen(PORT, () => {
     console.log(`🚀 MidiaService rodando na porta ${PORT}`);
-    console.log(`📁 Diretório de uploads: ${UPLOAD_DIR}`);
+    console.log(`📎 Limite por arquivo: ${Math.round(MAX_FILE_SIZE / BYTES_PER_MB)} MB`);
+    console.log(`🗄️  Arquivos: MongoDB GridFS (${GRIDFS_BUCKET_NAME})`);
     console.log(`🔐 Autenticação: Token Bearer`);
     console.log(`📤 Upload: POST /upload (com autenticação)`);
     console.log(`📥 Download: GET /download/:filename (público)`);
